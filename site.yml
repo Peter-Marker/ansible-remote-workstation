@@ -1,0 +1,5 @@
+- name: Configure Work Station VM
+  hosts: work_station
+  become: true
+  roles:
+    - role: work_station

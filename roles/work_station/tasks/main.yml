@@ -1,0 +1,491 @@
+---
+# Work Station VM Configuration
+# This role handles the full setup for the work-station VM:
+# hostname, OS updates, timezone, UFW firewall,
+# non-root user, xfce4 GUI, Google Chrome, Chrome Remote Desktop,
+# and 24/7 session configuration.
+
+# --- Hostname ---
+- name: Set hostname to work-station
+  ansible.builtin.hostname:
+    name: work-station
+
+- name: Ensure /etc/hosts contains hostname entry
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: "127\\.0\\.1\\.1"
+    line: "127.0.1.1 work-station"
+    state: present
+
+# --- OS Updates ---
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  changed_when: false
+
+- name: Fix interrupted dpkg state if present
+  ansible.builtin.shell:
+    cmd: "dpkg --configure -a"
+    executable: /bin/bash
+  changed_when: true
+  failed_when: false
+
+- name: Upgrade all packages to the latest version
+  ansible.builtin.apt:
+    upgrade: dist
+    autoremove: true
+    autoclean: true
+
+# --- Timezone ---
+- name: Set timezone from TIMEZONE environment variable
+  community.general.timezone:
+    name: "{{ lookup('env', 'TIMEZONE') | default('Europe/Dublin', true) }}"
+  notify: Restart rsyslog
+
+# --- Non-root Worker User ---
+- name: Create worker user account
+  ansible.builtin.user:
+    name: "{{ lookup('env', 'VAR_user_worker') }}"
+    shell: /bin/bash
+    groups: sudo
+    append: true
+    create_home: true
+    state: present
+
+- name: Set password for worker user via chpasswd
+  ansible.builtin.shell:
+    cmd: "set -o pipefail; echo '{{ lookup('env', 'VAR_user_worker') }}:{{
+      lookup('env', 'VAR_user_worker_password') | default('changeme', true) }}'
+      | chpasswd"
+    executable: /bin/bash
+  changed_when: true
+
+- name: Ensure sudo is installed
+  ansible.builtin.apt:
+    name: sudo
+    state: present
+
+- name: Ensure worker user has passwordless sudo access
+  ansible.builtin.lineinfile:
+    path: /etc/sudoers.d/010_{{ lookup('env', 'VAR_user_worker') }}-nopasswd
+    line: "{{ lookup('env', 'VAR_user_worker') }} ALL=(ALL) NOPASSWD:ALL"
+    state: present
+    validate: "visudo -cf %s"
+    mode: "0440"
+    create: true
+
+# --- UFW Firewall ---
+- name: Install UFW
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+
+- name: Set UFW default policy - deny incoming
+  community.general.ufw:
+    direction: incoming
+    default: deny
+
+- name: Set UFW default policy - allow outgoing
+  community.general.ufw:
+    direction: outgoing
+    default: allow
+
+- name: Allow SSH on custom port from trusted IPv4 networks
+  community.general.ufw:
+    rule: allow
+    port: "{{ lookup('env', 'TF_VAR_vm4_ssh_port') | default(2223, true) }}"
+    proto: tcp
+    src: "{{ item }}"
+    log: true
+  loop: "{{ lookup('env', 'TF_FW_SRC_IP4') | default('', true) | split(',') |
+    select('string') | list }}"
+  when: lookup('env', 'TF_FW_SRC_IP4') | default('', true) | length > 0
+
+- name: Allow SSH on custom port from trusted IPv6 networks
+  community.general.ufw:
+    rule: allow
+    port: "{{ lookup('env', 'TF_VAR_vm4_ssh_port') | default(2223, true) }}"
+    proto: tcp
+    src: "{{ item }}"
+    log: true
+  loop: "{{ lookup('env', 'TF_FW_SRC_IP6') | default('', true) | split(',') |
+    select('string') | list }}"
+  when: lookup('env', 'TF_FW_SRC_IP6') | default('', true) | length > 0
+
+- name: Allow SSH on custom port from any (no trusted IPv4 networks specified)
+  community.general.ufw:
+    rule: allow
+    port: "{{ lookup('env', 'TF_VAR_vm4_ssh_port') | default(2223, true) }}"
+    proto: tcp
+    log: true
+  when: lookup('env', 'TF_FW_SRC_IP4') | default('', true) | length == 0
+
+- name: Allow SSH on custom port from any (no trusted IPv6 networks specified)
+  community.general.ufw:
+    rule: allow
+    port: "{{ lookup('env', 'TF_VAR_vm4_ssh_port') | default(2223, true) }}"
+    proto: tcp
+    log: true
+  when: lookup('env', 'TF_FW_SRC_IP6') | default('', true) | length == 0
+
+- name: Enable UFW
+  community.general.ufw:
+    state: enabled
+
+# --- xfce4 Desktop Environment ---
+- name: Install xfce4 and xfce4-goodies
+  ansible.builtin.apt:
+    name:
+      - xfce4
+      - xfce4-goodies
+    state: present
+    install_recommends: true
+  notify: Restart lightdm
+
+- name: Install additional GUI utilities
+  ansible.builtin.apt:
+    name:
+      - xdg-utils
+      - dbus-x11
+      - fonts-liberation
+      - fonts-noto-color-emoji
+    state: present
+
+# --- LightDM Display Manager ---
+- name: Install lightdm and lightdm-gtk-greeter
+  ansible.builtin.apt:
+    name:
+      - lightdm
+      - lightdm-gtk-greeter
+    state: present
+  notify: Restart lightdm
+
+- name: Configure lightdm for proper user login
+  ansible.builtin.copy:
+    dest: /etc/lightdm/lightdm.conf
+    content: |
+      [Seat:*]
+      greeter-session=lightdm-gtk-greeter
+      user-session=xfce
+      allow-user-switching=true
+      allow-guest=false
+      autologin-user=
+      autologin-user-timeout=0
+      autologin-guest=false
+      lock-screen=false
+    mode: "0644"
+  notify: Restart lightdm
+
+- name: Set default X session to xfce
+  ansible.builtin.copy:
+    dest: /usr/share/xsessions/xfce.desktop
+    content: |
+      [Desktop Entry]
+      Name=XFCE Session
+      Comment=Default XFCE Session
+      Exec=/usr/bin/xfce4-session
+      Type=Application
+    mode: "0644"
+
+- name: Set default display manager to lightdm
+  ansible.builtin.debconf:
+    name: lightdm
+    question: shared/default-x-display-manager
+    vtype: select
+    value: lightdm
+
+- name: Ensure lightdm is enabled
+  ansible.builtin.systemd:
+    name: lightdm
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# --- Google Chrome Stable ---
+- name: Download Google Chrome Stable .deb package
+  ansible.builtin.get_url:
+    url: https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+    dest: /tmp/google-chrome-stable_current_amd64.deb
+    mode: "0644"
+
+- name: Install Google Chrome Stable
+  ansible.builtin.apt:
+    deb: /tmp/google-chrome-stable_current_amd64.deb
+    state: present
+
+- name: Clean up Chrome .deb package
+  ansible.builtin.file:
+    path: /tmp/google-chrome-stable_current_amd64.deb
+    state: absent
+
+# --- Chrome Remote Desktop ---
+- name: Download Chrome Remote Desktop .deb package
+  ansible.builtin.get_url:
+    url: https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb
+    dest: /tmp/chrome-remote-desktop_current_amd64.deb
+    mode: "0644"
+
+- name: Install Chrome Remote Desktop
+  ansible.builtin.apt:
+    deb: /tmp/chrome-remote-desktop_current_amd64.deb
+    state: present
+  notify: Restart crd
+
+- name: Clean up CRD .deb package
+  ansible.builtin.file:
+    path: /tmp/chrome-remote-desktop_current_amd64.deb
+    state: absent
+
+- name: Create Chrome Remote Desktop configuration directory
+  ansible.builtin.file:
+    path: "/home/{{ lookup('env', 'VAR_user_worker')
+      }}/.config/chrome-remote-desktop"
+    state: directory
+    owner: "{{ lookup('env', 'VAR_user_worker') }}"
+    group: "{{ lookup('env', 'VAR_user_worker') }}"
+    mode: "0755"
+
+- name: Configure Chrome Remote Desktop session for worker user
+  ansible.builtin.copy:
+    dest: "/home/{{ lookup('env', 'VAR_user_worker')
+      }}/.chrome-remote-desktop-session"
+    content: |
+      #!/bin/bash
+      exec /usr/bin/xfce4-session
+    owner: "{{ lookup('env', 'VAR_user_worker') }}"
+    group: "{{ lookup('env', 'VAR_user_worker') }}"
+    mode: "0755"
+  notify: Restart crd
+
+- name: Create .xsessionrc for worker user
+  ansible.builtin.copy:
+    dest: "/home/{{ lookup('env', 'VAR_user_worker') }}/.xsessionrc"
+    content: |
+      #!/bin/bash
+      exec /usr/bin/xfce4-session
+    owner: "{{ lookup('env', 'VAR_user_worker') }}"
+    group: "{{ lookup('env', 'VAR_user_worker') }}"
+    mode: "0755"
+
+- name: Create .xsession for worker user
+  ansible.builtin.copy:
+    dest: "/home/{{ lookup('env', 'VAR_user_worker') }}/.xsession"
+    content: |
+      #!/bin/bash
+      exec /usr/bin/xfce4-session
+    owner: "{{ lookup('env', 'VAR_user_worker') }}"
+    group: "{{ lookup('env', 'VAR_user_worker') }}"
+    mode: "0755"
+
+- name: Configure .profile for worker user
+  ansible.builtin.lineinfile:
+    path: "/home/{{ lookup('env', 'VAR_user_worker') }}/.profile"
+    line: "{{ item }}"
+    create: true
+    owner: "{{ lookup('env', 'VAR_user_worker') }}"
+    group: "{{ lookup('env', 'VAR_user_worker') }}"
+    mode: "0644"
+  loop:
+    - "export XDG_SESSION_TYPE=x11"
+    - "export XDG_CURRENT_DESKTOP=XFCE"
+
+- name: Create Chrome Remote Desktop systemd service override directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/chrome-remote-desktop.service.d
+    state: directory
+    mode: "0755"
+
+- name: Configure Chrome Remote Desktop to run as worker user
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/chrome-remote-desktop.service.d/override.conf
+    content: |
+      [Service]
+      User={{ lookup('env', 'VAR_user_worker') }}
+      Group={{ lookup('env', 'VAR_user_worker') }}
+      Environment=HOME=/home/{{ lookup('env', 'VAR_user_worker') }}
+      Environment=DISPLAY=:0
+      Environment=XDG_SESSION_TYPE=x11
+      Environment=XDG_CURRENT_DESKTOP=XFCE
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Ensure worker user is in chrome-remote-desktop group
+  ansible.builtin.user:
+    name: "{{ lookup('env', 'VAR_user_worker') }}"
+    groups: chrome-remote-desktop
+    append: true
+  failed_when: false
+
+- name: Stop Chrome Remote Desktop service before reconfiguration
+  ansible.builtin.systemd:
+    name: chrome-remote-desktop
+    state: stopped
+  failed_when: false
+
+- name: Remove CRD host token from worker user
+  ansible.builtin.file:
+    path: "/home/{{ lookup('env', 'VAR_user_worker')
+      }}/.config/chrome-remote-desktop/host*.json"
+    state: absent
+  failed_when: false
+
+- name: Enable Chrome Remote Desktop service (not started — must be registered first)
+  ansible.builtin.systemd:
+    name: chrome-remote-desktop
+    enabled: true
+    state: stopped
+    daemon_reload: true
+
+# --- Disable Sleep Mode, Screen Lock, Power Management (24/7) ---
+- name: Disable screen blanking (DPMS) for all users
+  ansible.builtin.copy:
+    dest: /etc/X11/xorg.conf.d/10-noblank.conf
+    content: |
+      Section "ServerFlags"
+          Option "BlankTime" "0"
+          Option "StandbyTime" "0"
+          Option "SuspendTime" "0"
+          Option "OffTime" "0"
+      EndSection
+    mode: "0644"
+
+- name: Create xfce4 xfconf config directory
+  ansible.builtin.file:
+    path: "/home/{{ lookup('env', 'VAR_user_worker')
+      }}/.config/xfce4/xfconf/xfce-perchannel-xml"
+    state: directory
+    owner: "{{ lookup('env', 'VAR_user_worker') }}"
+    group: "{{ lookup('env', 'VAR_user_worker') }}"
+    mode: "0755"
+
+- name: Disable xfce4 power manager - prevent sleep and screen blanking
+  ansible.builtin.copy:
+    dest: "/home/{{ lookup('env', 'VAR_user_worker')
+      }}/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-power-manager.xml"
+    content: |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <channel name="xfce4-power-manager" version="1.0">
+        <property name="xfce4-power-manager" type="empty">
+          <property name="power-button-action" type="empty"/>
+          <property name="show-panel-icon" type="empty"/>
+          <property name="show-tray-icon" type="bool" value="false"/>
+          <property name="blank-on-ac" type="int" value="0"/>
+          <property name="dpms-on-ac-sleep" type="uint" value="0"/>
+          <property name="dpms-on-ac-off" type="uint" value="0"/>
+          <property name="dpms-enabled" type="bool" value="false"/>
+          <property name="lock-screen-suspend-hibernate" type="bool" value="false"/>
+          <property name="logind-handle-lid-switch" type="bool" value="false"/>
+          <property name="network-manager-sleep" type="bool" value="false"/>
+        </property>
+      </channel>
+    owner: "{{ lookup('env', 'VAR_user_worker') }}"
+    group: "{{ lookup('env', 'VAR_user_worker') }}"
+    mode: "0644"
+
+- name: Disable xfce4 screensaver
+  ansible.builtin.copy:
+    dest: "/home/{{ lookup('env', 'VAR_user_worker')
+      }}/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-screensaver.xml"
+    content: |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <channel name="xfce4-screensaver" version="1.0">
+        <property name="saver" type="empty">
+          <property name="mode" type="int" value="0"/>
+          <property name="enabled" type="bool" value="false"/>
+        </property>
+        <property name="lock" type="empty">
+          <property name="enabled" type="bool" value="false"/>
+        </property>
+      </channel>
+    owner: "{{ lookup('env', 'VAR_user_worker') }}"
+    group: "{{ lookup('env', 'VAR_user_worker') }}"
+    mode: "0644"
+
+- name: Disable xfce4 session lock on suspend
+  ansible.builtin.copy:
+    dest: "/home/{{ lookup('env', 'VAR_user_worker')
+      }}/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml"
+    content: |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <channel name="xfce4-session" version="1.0">
+        <property name="general" type="empty">
+          <property name="FailsafeSessionName" type="string" value="Failsafe"/>
+          <property name="LockCommand" type="empty"/>
+        </property>
+        <property name="shutdown" type="empty">
+          <property name="LockScreen" type="bool" value="false"/>
+        </property>
+      </channel>
+    owner: "{{ lookup('env', 'VAR_user_worker') }}"
+    group: "{{ lookup('env', 'VAR_user_worker') }}"
+    mode: "0644"
+
+- name: Disable systemd sleep targets (suspend, hibernate, hybrid-sleep)
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: false
+    masked: true
+    state: stopped
+  loop:
+    - sleep.target
+    - suspend.target
+    - hibernate.target
+    - hybrid-sleep.target
+
+# --- Chrome Auto-Launch Configuration (Two Windows) ---
+- name: Create xfce4 autostart directory
+  ansible.builtin.file:
+    path: "/home/{{ lookup('env', 'VAR_user_worker') }}/.config/autostart"
+    state: directory
+    owner: "{{ lookup('env', 'VAR_user_worker') }}"
+    group: "{{ lookup('env', 'VAR_user_worker') }}"
+    mode: "0755"
+
+- name: Create Chrome Gemini window autostart entry
+  ansible.builtin.copy:
+    dest: "/home/{{ lookup('env', 'VAR_user_worker')
+      }}/.config/autostart/chrome-gemini.desktop"
+    content: |
+      [Desktop Entry]
+      Type=Application
+      Name=Chrome Gemini
+      Comment=Open Gemini in a separate window
+      Exec=/usr/bin/google-chrome-stable --no-first-run --disable-infobars --disable-popup-blocking --new-window --app=https://gemini.google.com/
+      Terminal=false
+      X-GNOME-Autostart-enabled=true
+      X-XFCE-Autostart=true
+    owner: "{{ lookup('env', 'VAR_user_worker') }}"
+    group: "{{ lookup('env', 'VAR_user_worker') }}"
+    mode: "0644"
+
+- name: Create Chrome Deep Research window autostart entry
+  ansible.builtin.copy:
+    dest: "/home/{{ lookup('env', 'VAR_user_worker')
+      }}/.config/autostart/chrome-deep-research.desktop"
+    content: |
+      [Desktop Entry]
+      Type=Application
+      Name=Chrome Deep Research
+      Comment=Open Deep Research in a separate window
+      Exec=/usr/bin/google-chrome-stable --no-first-run --disable-infobars
+        --disable-popup-blocking --new-window
+        --app=https://gemini.google.com/app/deep-research
+      Terminal=false
+      X-GNOME-Autostart-enabled=true
+      X-XFCE-Autostart=true
+    owner: "{{ lookup('env', 'VAR_user_worker') }}"
+    group: "{{ lookup('env', 'VAR_user_worker') }}"
+    mode: "0644"
+
+# --- Post-Install Reboot (if required) ---
+- name: Check if system reboot is required
+  ansible.builtin.stat:
+    path: /var/run/reboot-required
+  register: work_station_reboot_required
+
+- name: Reboot system if required after dist-upgrade
+  ansible.builtin.reboot:
+    msg: "Rebooting after system update"
+    reboot_timeout: 300
+  when: work_station_reboot_required.stat.exists
