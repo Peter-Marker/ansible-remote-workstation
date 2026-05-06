@@ -12,11 +12,18 @@
     state: restarted
 
 - name: Restart crd
-  ansible.builtin.service:
-    name: chrome-remote-desktop
-    state: restarted
+  ansible.builtin.systemd:
+    name: "chrome-remote-desktop@{{ lookup('env', 'VAR_user_worker') }}"
+    state: started
+    daemon_reload: true
   failed_when: false
 
 - name: Reload systemd
   ansible.builtin.systemd:
     daemon_reload: true
+
+- name: Reload udev rules
+  ansible.builtin.shell:
+    cmd: "udevadm control --reload-rules && udevadm trigger"
+    executable: /bin/bash
+  changed_when: true

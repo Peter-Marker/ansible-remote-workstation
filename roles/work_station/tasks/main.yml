@@ -10,6 +10,27 @@
   ansible.builtin.hostname:
     name: work-station
 
+- name: Unmount CD disk (cidata)
+  ansible.posix.mount:
+    path: "/media/{{ lookup('env', 'VAR_user_worker') }}/cidata"
+    state: absent
+  failed_when: false
+
+- name: Create udev rule to ignore cidata disk in udisks2
+  ansible.builtin.copy:
+    dest: /etc/udev/rules.d/99-ignore-cidata.rules
+    content: |
+      # Ignore cloud-init cidata ISO from automount by udisks2
+      ENV{ID_FS_LABEL}=="cidata", ENV{UDISKS_IGNORE}="1"
+    mode: "0644"
+  notify: Reload udev rules
+
+- name: Remove cidata mount point directory
+  ansible.builtin.file:
+    path: "/media/{{ lookup('env', 'VAR_user_worker') }}/cidata"
+    state: absent
+  failed_when: false
+
 - name: Ensure /etc/hosts contains hostname entry
   ansible.builtin.lineinfile:
     path: /etc/hosts
@@ -66,10 +87,10 @@
     name: sudo
     state: present
 
-- name: Ensure worker user has passwordless sudo access
+- name: Ensure worker user has sudo access with password
   ansible.builtin.lineinfile:
-    path: /etc/sudoers.d/010_{{ lookup('env', 'VAR_user_worker') }}-nopasswd
-    line: "{{ lookup('env', 'VAR_user_worker') }} ALL=(ALL) NOPASSWD:ALL"
+    path: /etc/sudoers.d/010_{{ lookup('env', 'VAR_user_worker') }}
+    line: "{{ lookup('env', 'VAR_user_worker') }} ALL=(ALL) ALL"
     state: present
     validate: "visudo -cf %s"
     mode: "0440"
@@ -148,8 +169,14 @@
     name:
       - xdg-utils
       - dbus-x11
+      - dbus-user-session
       - fonts-liberation
       - fonts-noto-color-emoji
+      - at-spi2-core
+      - polkitd
+      - policykit-1
+      - libpam-systemd
+      - systemd-sysv
     state: present
 
 # --- LightDM Display Manager ---
@@ -230,7 +257,6 @@
   ansible.builtin.apt:
     deb: /tmp/chrome-remote-desktop_current_amd64.deb
     state: present
-  notify: Restart crd
 
 - name: Clean up CRD .deb package
   ansible.builtin.file:
@@ -256,7 +282,6 @@
     owner: "{{ lookup('env', 'VAR_user_worker') }}"
     group: "{{ lookup('env', 'VAR_user_worker') }}"
     mode: "0755"
-  notify: Restart crd
 
 - name: Create .xsessionrc for worker user
   ansible.builtin.copy:
@@ -290,51 +315,117 @@
     - "export XDG_SESSION_TYPE=x11"
     - "export XDG_CURRENT_DESKTOP=XFCE"
 
-- name: Create Chrome Remote Desktop systemd service override directory
+- name: Create per-user Chrome Remote Desktop systemd override directory
   ansible.builtin.file:
-    path: /etc/systemd/system/chrome-remote-desktop.service.d
+    path: /etc/systemd/system/chrome-remote-desktop@.service.d
     state: directory
     mode: "0755"
 
-- name: Configure Chrome Remote Desktop to run as worker user
+- name: Configure per-user Chrome Remote Desktop service environment
   ansible.builtin.copy:
-    dest: /etc/systemd/system/chrome-remote-desktop.service.d/override.conf
+    dest: /etc/systemd/system/chrome-remote-desktop@.service.d/override.conf
     content: |
       [Service]
-      User={{ lookup('env', 'VAR_user_worker') }}
-      Group={{ lookup('env', 'VAR_user_worker') }}
       Environment=HOME=/home/{{ lookup('env', 'VAR_user_worker') }}
       Environment=DISPLAY=:0
       Environment=XDG_SESSION_TYPE=x11
       Environment=XDG_CURRENT_DESKTOP=XFCE
+      Environment=XDG_RUNTIME_DIR=/run/user/%i
+      Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%i/bus
     mode: "0644"
   notify: Reload systemd
+
+# --- D-Bus Session Configuration for CRD ---
+- name: Create D-Bus system config directory for CRD
+  ansible.builtin.file:
+    path: /etc/dbus-1/system.d
+    state: directory
+    mode: "0755"
+
+- name: Configure D-Bus access for chrome-remote-desktop
+  ansible.builtin.copy:
+    dest: /etc/dbus-1/system.d/chrome-remote-desktop.conf
+    content: |
+      <!DOCTYPE busconfig PUBLIC
+       "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+       "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+      <busconfig>
+        <policy user="{{ lookup('env', 'VAR_user_worker') }}">
+          <allow own="org.chromium.RemoteDesktop"/>
+          <allow send_destination="org.chromium.RemoteDesktop"/>
+          <allow send_interface="org.chromium.RemoteDesktop"/>
+        </policy>
+      </busconfig>
+    mode: "0644"
+
+# --- Polkit Configuration for CRD ---
+- name: Create polkit rules directory
+  ansible.builtin.file:
+    path: /etc/polkit-1/rules.d
+    state: directory
+    mode: "0755"
+
+- name: Configure polkit rule for chrome-remote-desktop
+  ansible.builtin.copy:
+    dest: /etc/polkit-1/rules.d/90-chrome-remote-desktop.rules
+    content: |
+      polkit.addRule(function(action, subject) {
+        if (action.id == "org.freedesktop.login1.suspend" ||
+            action.id == "org.freedesktop.login1.hibernate" ||
+            action.id == "org.freedesktop.login1.suspend-multiple-sessions" ||
+            action.id == "org.freedesktop.login1.hibernate-multiple-sessions") {
+          return polkit.Result.YES;
+        }
+      });
+    mode: "0644"
+
+- name: Ensure polkit service is running
+  ansible.builtin.systemd:
+    name: polkit
+    state: started
+    enabled: true
+
+- name: Ensure chrome-remote-desktop group exists
+  ansible.builtin.group:
+    name: chrome-remote-desktop
+    state: present
+  failed_when: false
 
 - name: Ensure worker user is in chrome-remote-desktop group
   ansible.builtin.user:
     name: "{{ lookup('env', 'VAR_user_worker') }}"
     groups: chrome-remote-desktop
     append: true
-  failed_when: false
 
-- name: Stop Chrome Remote Desktop service before reconfiguration
-  ansible.builtin.systemd:
-    name: chrome-remote-desktop
-    state: stopped
-  failed_when: false
+- name: Enable linger for worker user (allows services to run without login)
+  ansible.builtin.shell:
+    cmd: "loginctl enable-linger {{ lookup('env', 'VAR_user_worker') }}"
+    executable: /bin/bash
+  changed_when: true
 
-- name: Remove CRD host token from worker user
+- name: Ensure user runtime directory exists
   ansible.builtin.file:
-    path: "/home/{{ lookup('env', 'VAR_user_worker')
-      }}/.config/chrome-remote-desktop/host*.json"
-    state: absent
+    path: "/run/user/{{ lookup('env', 'VAR_user_worker_uid') | default('1001', true)
+      }}"
+    state: directory
+    owner: "{{ lookup('env', 'VAR_user_worker') }}"
+    group: "{{ lookup('env', 'VAR_user_worker') }}"
+    mode: "0700"
   failed_when: false
 
-- name: Enable Chrome Remote Desktop service (not started — must be registered first)
+- name: Disable old multi-process host service (use per-user instance instead)
   ansible.builtin.systemd:
     name: chrome-remote-desktop
-    enabled: true
+    enabled: false
     state: stopped
+    masked: true
+    daemon_reload: true
+
+- name: Enable and start per-user Chrome Remote Desktop service template
+  ansible.builtin.systemd:
+    name: "chrome-remote-desktop@{{ lookup('env', 'VAR_user_worker') }}"
+    enabled: true
+    state: started
     daemon_reload: true
 
 # --- Disable Sleep Mode, Screen Lock, Power Management (24/7) ---
@@ -432,51 +523,6 @@
     - suspend.target
     - hibernate.target
     - hybrid-sleep.target
-
-# --- Chrome Auto-Launch Configuration (Two Windows) ---
-- name: Create xfce4 autostart directory
-  ansible.builtin.file:
-    path: "/home/{{ lookup('env', 'VAR_user_worker') }}/.config/autostart"
-    state: directory
-    owner: "{{ lookup('env', 'VAR_user_worker') }}"
-    group: "{{ lookup('env', 'VAR_user_worker') }}"
-    mode: "0755"
-
-- name: Create Chrome Gemini window autostart entry
-  ansible.builtin.copy:
-    dest: "/home/{{ lookup('env', 'VAR_user_worker')
-      }}/.config/autostart/chrome-gemini.desktop"
-    content: |
-      [Desktop Entry]
-      Type=Application
-      Name=Chrome Gemini
-      Comment=Open Gemini in a separate window
-      Exec=/usr/bin/google-chrome-stable --no-first-run --disable-infobars --disable-popup-blocking --new-window --app=https://gemini.google.com/
-      Terminal=false
-      X-GNOME-Autostart-enabled=true
-      X-XFCE-Autostart=true
-    owner: "{{ lookup('env', 'VAR_user_worker') }}"
-    group: "{{ lookup('env', 'VAR_user_worker') }}"
-    mode: "0644"
-
-- name: Create Chrome Deep Research window autostart entry
-  ansible.builtin.copy:
-    dest: "/home/{{ lookup('env', 'VAR_user_worker')
-      }}/.config/autostart/chrome-deep-research.desktop"
-    content: |
-      [Desktop Entry]
-      Type=Application
-      Name=Chrome Deep Research
-      Comment=Open Deep Research in a separate window
-      Exec=/usr/bin/google-chrome-stable --no-first-run --disable-infobars
-        --disable-popup-blocking --new-window
-        --app=https://gemini.google.com/app/deep-research
-      Terminal=false
-      X-GNOME-Autostart-enabled=true
-      X-XFCE-Autostart=true
-    owner: "{{ lookup('env', 'VAR_user_worker') }}"
-    group: "{{ lookup('env', 'VAR_user_worker') }}"
-    mode: "0644"
 
 # --- Post-Install Reboot (if required) ---
 - name: Check if system reboot is required

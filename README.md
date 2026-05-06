@@ -4,16 +4,16 @@
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-24.04-E95420?style=flat&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Automate the provisioning of a **24/7 remote workstation** on Ubuntu VMs using Ansible. This project transforms a bare Ubuntu server into a fully functional desktop environment accessible via Chrome Remote Desktop — ideal for AI-assisted research, continuous workflows, or headless development stations.
+Automate the provisioning of a **24/7 remote workstation** on Ubuntu VMs using Ansible. This project transforms a bare Ubuntu server into a fully functional desktop environment accessible via Chrome Remote Desktop — ideal for continuous workflows, remote development, or headless desktop stations.
 
 ## Features
 
 - **XFCE4 Desktop Environment** — Lightweight, stable, and resource-efficient
-- **Chrome Remote Desktop** — Secure, cross-platform remote access
-- **Google Chrome** — Pre-installed with auto-launch configuration
-- **UFW Firewall** — Pre-configured with custom SSH port and IP whitelisting
-- **24/7 Always-On** — Sleep, screen lock, and power management fully disabled
-- **Auto-Launch Apps** — Chrome windows open automatically on boot (configurable URLs)
+- **Chrome Remote Desktop** — Secure, cross-platform remote access with per-user service
+- **Google Chrome** — Pre-installed web browser
+- **UFW Firewall** — Pre-configured with custom SSH port and IP whitelisting (IPv4/IPv6)
+- **24/7 Always-On** — Sleep, screen lock, DPMS, and power management fully disabled
+- **D-Bus & Polkit** — Properly configured for CRD service permissions
 - **Idempotent Design** — Safe to run multiple times without side effects
 
 ## Architecture
@@ -22,11 +22,11 @@ Automate the provisioning of a **24/7 remote workstation** on Ubuntu VMs using A
 ┌─────────────────────────────────────────────────────────┐
 │                    Ubuntu 24.04 VM                      │
 │                                                         │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐ │
-│  │   LightDM   │─▶│   XFCE4      │─▶│  Chrome Windows│ │
-│  │  (Display   │  │  (Desktop    │  │  (Auto-launch) │ │
-│  │   Manager)  │  │   Session)   │  │                │ │
-│  └─────────────┘  └──────────────┘  └────────────────┘ │
+│  ┌─────────────┐  ┌──────────────┐                      │
+│  │   LightDM   │─▶│   XFCE4      │                      │
+│  │  (Display   │  │  (Desktop    │                      │
+│  │   Manager)  │  │   Session)   │                      │
+│  └─────────────┘  └──────────────┘                      │
 │         ▲                                               │
 │         │                                               │
 │  ┌──────────────┐                                       │
@@ -110,6 +110,7 @@ ansible-playbook site.yml \
 |----------|-------------|---------|----------|
 | `VAR_user_worker` | Non-root user to create | — | Yes |
 | `VAR_user_worker_password` | Password for the worker user | `changeme` | Yes |
+| `VAR_user_worker_uid` | UID for the worker user (for runtime dir) | `1001` | No |
 | `TF_VAR_vm4_ssh_port` | SSH port for UFW rules | `2223` | No |
 | `TF_FW_SRC_IP4` | Trusted IPv4 networks (comma-separated) | *(allow any)* | No |
 | `TF_FW_SRC_IP6` | Trusted IPv6 networks (comma-separated) | *(allow any)* | No |
@@ -120,29 +121,42 @@ ansible-playbook site.yml \
 | Component | Purpose |
 |-----------|---------|
 | `xfce4` + `xfce4-goodies` | Desktop environment |
-| `lightdm` + `lightdm-gtk-greeter` | Display manager |
+| `lightdm` + `lightdm-gtk-greeter` | Display manager (no auto-login, guest disabled) |
 | `google-chrome-stable` | Web browser |
-| `chrome-remote-desktop` | Remote access service |
+| `chrome-remote-desktop` | Remote access service (per-user) |
 | `ufw` | Uncomplicated Firewall |
-| `xdg-utils`, `dbus-x11`, `fonts-*` | Supporting utilities |
+| `xdg-utils`, `dbus-x11`, `dbus-user-session` | X11 utilities and D-Bus session |
+| `fonts-liberation`, `fonts-noto-color-emoji` | Font packages |
+| `at-spi2-core`, `polkitd`, `policykit-1` | Accessibility and policy management |
+| `libpam-systemd`, `systemd-sysv`, `sudo` | System utilities |
+
+### Chrome Remote Desktop Configuration
+
+The playbook configures CRD to run as a per-user service with proper D-Bus and polkit permissions:
+
+| Configuration | Purpose |
+|---------------|---------|
+| System-wide service | Disabled, stopped, and masked (replaced by per-user instance) |
+| Per-user service template | `chrome-remote-desktop@<user>` enabled and started |
+| D-Bus policy | Allows worker user to own `org.chromium.RemoteDesktop` |
+| Polkit rule | Grants suspend/hibernate permissions for CRD |
+| Session files | `.chrome-remote-desktop-session`, `.xsession`, `.xsessionrc` all launch XFCE |
+| Systemd override | Sets `HOME`, `DISPLAY`, `XDG_*`, and `DBUS_SESSION_BUS_ADDRESS` |
+| User linger | Enabled via `loginctl enable-linger` so services run without active login |
+| cidata handling | Unmounts cloud-init cidata ISO and adds udev rule to prevent automount |
 
 ### Post-Setup Steps
 
-After the playbook completes, you must **register Chrome Remote Desktop**:
+After the playbook completes, register Chrome Remote Desktop:
 
-1. Connect to the VM via SSH as the worker user:
-   ```bash
-   ssh -p YOUR_SSH_PORT worker@YOUR_VM_IP
-   ```
+1. Follow the instructions at [remotedesktop.google.com/headless](https://remotedesktop.google.com/headless) to generate and run the registration command on the VM.
 
-2. Start the CRD registration:
-   ```bash
-   /opt/google/chrome-remote-desktop/start-host
-   ```
+2. Set a PIN when prompted (at least 6 digits).
 
-3. Follow the on-screen instructions to generate and paste an authorization URL.
+3. Manage your remote workstation at [remotedesktop.google.com/access](https://remotedesktop.google.com/access).
 
-4. Once registered, connect via [remotedesktop.google.com](https://remotedesktop.google.com/).
+> **To add a new host**, follow the instructions at [remotedesktop.google.com/headless](https://remotedesktop.google.com/headless).
+> **To manage existing hosts**, visit [remotedesktop.google.com/access](https://remotedesktop.google.com/access).
 
 ## Project Structure
 
@@ -167,17 +181,17 @@ After the playbook completes, you must **register Chrome Remote Desktop**:
 
 The [`roles/work_station/tasks/main.yml`](roles/work_station/tasks/main.yml) role executes in this order:
 
-1. **Hostname** — Sets `work-station` as the system hostname
-2. **System Updates** — Updates apt cache and upgrades all packages
-3. **Timezone** — Configures system timezone
-4. **Worker User** — Creates a non-root user with passwordless sudo
-5. **UFW Firewall** — Configures firewall with custom SSH port and IP rules
-6. **XFCE4 Desktop** — Installs desktop environment and display manager
-7. **Google Chrome** — Downloads and installs Chrome stable
-8. **Chrome Remote Desktop** — Installs and configures CRD service
-9. **Power Management** — Disables all sleep, suspend, and screen lock features
-10. **Auto-Launch** — Configures Chrome windows to open on boot
-11. **Reboot** — Reboots the system if required after updates
+1. **Hostname** — Sets `work-station` as the system hostname, updates `/etc/hosts`, unmounts cidata ISO, and adds udev rule to prevent automount
+2. **System Updates** — Updates apt cache, fixes interrupted dpkg state, and upgrades all packages (`dist` upgrade with autoremove/autoclean)
+3. **Timezone** — Configures system timezone (notifies rsyslog restart)
+4. **Worker User** — Creates a non-root user with sudo access (password required), sets password via `chpasswd`, and adds to `chrome-remote-desktop` group
+5. **UFW Firewall** — Configures firewall with custom SSH port and optional IP whitelisting (IPv4/IPv6), default-deny incoming
+6. **XFCE4 Desktop** — Installs desktop environment, supporting utilities, fonts, and accessibility tools
+7. **LightDM Display Manager** — Installs and configures LightDM with GTK greeter (no auto-login, guest disabled, lock-screen disabled)
+8. **Google Chrome** — Downloads and installs Chrome stable from Google's repository
+9. **Chrome Remote Desktop** — Installs CRD, configures per-user systemd service, D-Bus policy, polkit rules, session files, and enables user linger
+10. **Power Management** — Disables all sleep, suspend, screen lock, DPMS, and XFCE screensaver for 24/7 operation
+11. **Reboot** — Reboots the system if `/var/run/reboot-required` exists
 
 ## Security Considerations
 
@@ -204,11 +218,11 @@ ansible-playbook site.yml --ask-vault-pass
 ### Chrome Remote Desktop won't start
 
 ```bash
-# Check service status
-systemctl status chrome-remote-desktop
+# Check per-user service status
+systemctl status chrome-remote-desktop@<worker_user>
 
 # View logs
-journalctl -u chrome-remote-desktop -f
+journalctl -u chrome-remote-desktop@<worker_user> -f
 
 # Re-register the host
 /opt/google/chrome-remote-desktop/start-host
